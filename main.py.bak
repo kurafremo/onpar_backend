@@ -1,0 +1,568 @@
+from fastapi import FastAPI, Depends, HTTPException, status, Request
+from fastapi.responses import JSONResponse
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from sqlalchemy.orm import Session
+from sqlalchemy import or_, func
+from typing import List, Optional
+from datetime import datetime, timedelta
+from pydantic import BaseModel, field_validator, ValidationInfo, ConfigDict
+from passlib.context import CryptContext
+from jose import JWTError, jwt
+
+import re
+import os
+import json
+import time
+import random
+import google.generativeai as genai
+
+import models
+from database import engine, get_db, SessionLocal
+from dotenv import load_dotenv
+from fastapi.middleware.cors import CORSMiddleware
+
+# --- 1. ÇEVRE DEĞİŞKENLERİNİ (GİZLİ KASA) YÜKLE ---
+load_dotenv()
+
+# GÜVENLİK DOKUNUŞU: os.environ kullanıyoruz. Şifreler koda ASLA açık yazılmaz!
+SECRET_KEY = os.environ["SECRET_KEY"]
+REFRESH_SECRET_KEY = os.environ.get("REFRESH_SECRET_KEY", SECRET_KEY + "_refresh")
+ALGORITHM = os.environ.get("ALGORITHM", "HS256")
+ACCESS_TOKEN_EXPIRE_MINUTES = 30  # 30 Dakika Kısa Ömürlü
+REFRESH_TOKEN_EXPIRE_DAYS = 30    # 30 Günlük Yenileme Anahtarı
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+
+CF_ZERO_TRUST_ENABLED = os.getenv("CF_ZERO_TRUST_ENABLED", "false").lower() == "true"
+CF_AUDIENCE = os.getenv("CF_AUDIENCE", "")
+
+# --- 2. UYGULAMAYI BAŞLAT VE CORS AYARLARI ---
+app = FastAPI(title="On-Par Yedek Parça Profesyonel API", version="3.1.0")
+
+# Sadece izin verilen adresler (Antigravity'nin açtığı güvenlik açığı kapatıldı!)
+origins = [
+    "https://torosoto.com",
+    "https://www.torosoto.com",
+    "https://api.torosoto.com"
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
+    allow_headers=["*"],
+)
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login") 
+
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+# --- 3. ÇİFT TOKEN (JWT) MEKANİZMASI ---
+def create_token(data: dict, expires_delta: timedelta, secret: str, token_type: str):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + expires_delta
+    to_encode.update({"exp": expire, "type": token_type})
+    encoded_jwt = jwt.encode(to_encode, secret, algorithm=ALGORITHM)
+    return encoded_jwt
+
+# --- 4. GÜVENLİK (AUTH) KİLİDİ: BÜTÜN ROTALARI KORUYAN FONKSİYON ---
+# Antigravity'nin sildiği en önemli güvenlik kilidini geri getirdik!
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Kimlik doğrulanamadı, geçersiz veya süresi dolmuş token!",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        token_type: str = payload.get("type")
+        
+        if username is None or token_type != "access":
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+        
+    user = db.query(models.User).filter(models.User.username == username).first()
+    if user is None:
+        raise credentials_exception
+    return user
+
+# --- 5. VERİTABANI BAŞLANGIÇ AYARLARI VE TOHUMLAMA ---
+models.Base.metadata.create_all(bind=engine)
+
+def create_default_admin():
+    db = SessionLocal()
+    try:
+        if not db.query(models.User).filter(models.User.username == "Patron").first():
+            db.add(models.User(username="Patron", pin_hash=get_password_hash("1234"), role="admin"))
+            db.commit()
+    finally:
+        db.close()
+
+def seed_katalog_verileri():
+    db = SessionLocal()
+    try:
+        if db.query(models.SparePart).count() == 0:
+            db.add_all([
+                models.SparePart(name="Bosch Rot Kolu", oem_code="1K0423812J", barcode="8690000000012", brand="Bosch", buy_price=350, sell_price=500, stock_quantity=45),
+                models.SparePart(name="Bosch Rot Başı", oem_code="1K0423811J", barcode="8690000000029", brand="Bosch", buy_price=400, sell_price=600, stock_quantity=30)
+            ])
+        if db.query(models.Supplier).count() == 0:
+            db.add(models.Supplier(name="Toros Toptan Otomotiv A.Ş.", contact_person="Yusuf Yılmaz", phone="0212 555 44 33"))
+        db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
+
+create_default_admin()
+seed_katalog_verileri()
+
+
+# --- 6. BRUTE-FORCE KORUMASI VE CLOUDFLARE MIDDLEWARE ---
+def get_client_ip(request: Request) -> str:
+    cf_ip = request.headers.get("CF-Connecting-IP")
+    if cf_ip: return cf_ip.strip()
+    x_forwarded_for = request.headers.get("X-Forwarded-For")
+    if x_forwarded_for: return x_forwarded_for.split(",")[0].strip()
+    return request.client.host if request.client else "127.0.0.1"
+
+class InMemoryRateLimiter:
+    def __init__(self, max_attempts: int, window_seconds: int):
+        self.max_attempts = max_attempts
+        self.window_seconds = window_seconds
+        self._attempts = {}
+
+    def _clean(self, key: str, now: float):
+        if key in self._attempts:
+            self._attempts[key] = [t for t in self._attempts[key] if now - t < self.window_seconds]
+            if not self._attempts[key]: del self._attempts[key]
+
+    def is_rate_limited(self, key: str) -> tuple[bool, int]:
+        now = time.time()
+        self._clean(key, now)
+        attempts = self._attempts.get(key, [])
+        if len(attempts) >= self.max_attempts:
+            return True, int(self.window_seconds - (now - attempts[0]))
+        return False, 0
+
+    def record_failure(self, key: str):
+        now = time.time()
+        self._clean(key, now)
+        if key not in self._attempts: self._attempts[key] = []
+        self._attempts[key].append(now)
+
+    def reset(self, key: str):
+        if key in self._attempts: del self._attempts[key]
+
+ip_login_limiter = InMemoryRateLimiter(max_attempts=10, window_seconds=300)
+user_login_limiter = InMemoryRateLimiter(max_attempts=5, window_seconds=300)
+
+@app.middleware("http")
+async def cloudflare_zero_trust_middleware(request: Request, call_next):
+    public_paths = ["/docs", "/redoc", "/openapi.json", "/health", "/login", "/users", "/register"]
+    if request.url.path in public_paths or not CF_ZERO_TRUST_ENABLED:
+        return await call_next(request)
+
+    cf_assertion = request.headers.get("Cf-Access-Jwt-Assertion")
+    if not cf_assertion:
+        return JSONResponse(status_code=403, content={"detail": "Erişim Reddedildi: Zero Trust Başlığı Eksik."})
+    
+    # Detaylı CF doğrulaması (Gerçekte CF genel anahtarlarıyla doğrulanır, şimdilik basit varlık kontrolü)
+    return await call_next(request)
+
+# --- 7. Pydantic Şemaları ---
+class SparePartBase(BaseModel):
+    name: str
+    oem_code: Optional[str] = None
+    barcode: Optional[str] = None
+    brand: Optional[str] = None
+    supplier_id: Optional[str] = None
+    compatible_vehicles: Optional[List[str]] = []
+    buy_price: float
+    sell_price: float
+    stock_quantity: int = 0
+    critical_stock_level: int = 5
+
+    @field_validator('compatible_vehicles', mode='before')
+    @classmethod
+    def parse_vehicles(cls, v):
+        if isinstance(v, str):
+            v = v.strip("{}")  
+            return [x.strip().strip('"').strip("'") for x in v.split(',')] if v else []
+        return v or []
+
+class SparePartCreate(SparePartBase): pass
+
+class SparePartResponse(SparePartBase):
+    id: int
+    created_at: datetime
+    model_config = ConfigDict(from_attributes=True)
+
+class BrandSummaryResponse(BaseModel):
+    brand: str
+    count: int
+    total_count: Optional[int] = None
+
+class SaleRecordBase(BaseModel):
+    part_id: str
+    client_transaction_id: Optional[str] = None 
+    part_name: Optional[str] = None
+    quantity: int = 1
+    unit_price: float
+    total_price: float
+    buyer_name: Optional[str] = None
+    company_name: Optional[str] = None
+    vehicle_plate: Optional[str] = None
+    vehicle_brand_model: Optional[str] = None
+    notes: Optional[str] = None
+
+class SaleRecordResponse(SaleRecordBase):
+    id: int
+    created_at: datetime
+    model_config = ConfigDict(from_attributes=True)
+
+class SupplierBase(BaseModel):
+    name: str
+    contact_person: Optional[str] = None
+    phone: Optional[str] = None
+    address: Optional[str] = None
+
+class SupplierResponse(SupplierBase):
+    id: int
+    model_config = ConfigDict(from_attributes=True)
+
+class UserCreate(BaseModel):
+    username: str
+    pin: Optional[str] = None
+    password: Optional[str] = None
+    master_key: Optional[str] = None 
+
+class UserResponse(BaseModel):
+    id: int
+    username: str
+    role: str
+    model_config = ConfigDict(from_attributes=True)
+
+class TokenResponse(BaseModel):
+    access_token: str
+    refresh_token: Optional[str] = None
+    token_type: str = "bearer"
+    id: int
+    username: str
+    role: str
+
+class RefreshTokenRequest(BaseModel):
+    refresh_token: str
+
+class PromptRequest(BaseModel):
+    prompt: str
+
+
+# --- 8. ROTALAR (API ENDPOINTS) ---
+
+@app.get("/")
+def read_root():
+    return {"status": "success", "message": "Torosoto Backend Zırhlı ve Ayakta!"}
+
+# KAYIT OLMA - Herkese Açık (get_current_user YOK)
+@app.post("/users", response_model=UserResponse, status_code=201)
+@app.post("/register", response_model=UserResponse, status_code=201)
+def create_user(user: UserCreate, db: Session = Depends(get_db)):
+    if db.query(models.User).filter(models.User.username == user.username).first():
+        raise HTTPException(status_code=400, detail="Bu kullanıcı adı zaten kullanılıyor")
+    
+    pin_val = user.pin or user.password
+    if not pin_val: raise HTTPException(status_code=400, detail="PIN zorunludur")
+
+    assigned_role = "admin" if user.master_key == "TOROS2026" else "employee"
+    new_user = models.User(username=user.username, pin_hash=get_password_hash(pin_val), role=assigned_role)
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+    return new_user
+
+# GİRİŞ YAPMA - Herkese Açık (Form-Data ve JSON Destekli)
+@app.post("/login", response_model=TokenResponse)
+async def login(request: Request, db: Session = Depends(get_db)):
+    content_type = request.headers.get("content-type", "")
+    username, pin_or_pass = None, None
+
+    if "application/x-www-form-urlencoded" in content_type or "multipart/form-data" in content_type:
+        form = await request.form()
+        username, pin_or_pass = form.get("username"), (form.get("password") or form.get("pin"))
+    else:
+        try:
+            body = await request.json()
+            username, pin_or_pass = body.get("username"), (body.get("password") or body.get("pin"))
+        except: pass
+
+    if not username or not pin_or_pass:
+        raise HTTPException(status_code=422, detail="Kullanıcı adı ve PIN zorunludur")
+
+    client_ip = get_client_ip(request)
+    is_ip_blocked, ip_retry = ip_login_limiter.is_rate_limited(client_ip)
+    if is_ip_blocked: raise HTTPException(status_code=429, detail=f"Çok fazla deneme. {ip_retry} sn bekleyin.")
+
+    user = db.query(models.User).filter(models.User.username == str(username).strip()).first()
+    if not user or not verify_password(str(pin_or_pass).strip(), user.pin_hash):
+        ip_login_limiter.record_failure(client_ip)
+        raise HTTPException(status_code=401, detail="Hatalı Kullanıcı Adı veya PIN Kodu")
+
+    ip_login_limiter.reset(client_ip)
+    
+    token_data = {"sub": user.username, "role": user.role}
+    access_token = create_token(token_data, timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES), SECRET_KEY, "access")
+    refresh_token = create_token(token_data, timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS), REFRESH_SECRET_KEY, "refresh")
+
+    return TokenResponse(access_token=access_token, refresh_token=refresh_token, id=user.id, username=user.username, role=user.role)
+
+# TOKEN YENİLEME
+@app.post("/refresh-token", response_model=TokenResponse)
+def refresh_token_endpoint(payload: RefreshTokenRequest, db: Session = Depends(get_db)):
+    try:
+        decoded = jwt.decode(payload.refresh_token, REFRESH_SECRET_KEY, algorithms=[ALGORITHM])
+        if decoded.get("type") != "refresh": raise JWTError()
+        username = decoded.get("sub")
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Yenileme anahtarı geçersiz veya süresi dolmuş")
+
+    user = db.query(models.User).filter(models.User.username == username).first()
+    if not user: raise HTTPException(status_code=401, detail="Kullanıcı hesabı bulunamadı")
+
+    token_data = {"sub": user.username, "role": user.role}
+    new_access = create_token(token_data, timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES), SECRET_KEY, "access")
+    new_refresh = create_token(token_data, timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS), REFRESH_SECRET_KEY, "refresh")
+
+    return TokenResponse(access_token=new_access, refresh_token=new_refresh, id=user.id, username=user.username, role=user.role)
+
+# --- AŞAĞIDAKİ TÜM ROTALAR GÜVENLİKLİDİR (Depends(get_current_user) EKLENDİ) ---
+
+@app.get("/users", response_model=List[UserResponse])
+def get_users(db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    return db.query(models.User).all()
+
+@app.get("/brands/summary", response_model=List[BrandSummaryResponse])
+def get_brands_summary(db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    results = db.query(models.SparePart.brand, func.count(models.SparePart.id)).group_by(models.SparePart.brand).all()
+    summary_map = {}
+    for brand_name, count in results:
+        clean_brand = (brand_name or "").strip()
+        display_name = clean_brand if clean_brand else "Diğer / Markasız"
+        summary_map[display_name] = summary_map.get(display_name, 0) + count
+
+    sorted_brands = sorted(summary_map.keys(), key=lambda b: (1 if b == "Diğer / Markasız" else 0, b.lower()))
+    return [BrandSummaryResponse(brand=b, count=summary_map[b], total_count=summary_map[b]) for b in sorted_brands]
+
+@app.get("/spare_parts", response_model=List[SparePartResponse])
+def get_spare_parts(q: Optional[str] = None, brand: Optional[str] = None, skip: int = 0, limit: int = 50, 
+                    db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    query = db.query(models.SparePart)
+
+    if brand:
+        clean_brand = brand.strip()
+        if clean_brand == "Diğer / Markasız":
+            query = query.filter(or_(models.SparePart.brand.is_(None), models.SparePart.brand == ""))
+        else:
+            query = query.filter(models.SparePart.brand.ilike(clean_brand))
+
+    if q:
+        search_query = f"%{q.strip().lower()}%"
+        query = query.filter(or_(
+            models.SparePart.name.ilike(search_query),
+            models.SparePart.oem_code.ilike(search_query),
+            models.SparePart.barcode.ilike(search_query)
+        ))
+
+    parts = query.order_by(models.SparePart.id.desc()).offset(skip).limit(limit).all()
+    for part in parts:
+        if isinstance(part.compatible_vehicles, str):
+            part.compatible_vehicles = part.compatible_vehicles.split(",") if part.compatible_vehicles else []
+    return parts
+
+@app.post("/spare_parts", response_model=SparePartResponse, status_code=201)
+@app.post("/parts", response_model=SparePartResponse, status_code=201)
+def create_spare_part(part: SparePartCreate, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    try:
+        if not part.barcode or part.barcode.strip() == "":
+            part.barcode = f"ONP-{int(time.time())}-{random.randint(1000, 9999)}"
+            
+        if db.query(models.SparePart).filter(models.SparePart.barcode == part.barcode).first():
+            raise HTTPException(status_code=400, detail="Bu barkod sistemde zaten kayıtlı!")
+
+        vehicles_str = ",".join(part.compatible_vehicles) if part.compatible_vehicles else ""
+        db_part = models.SparePart(**part.model_dump(exclude={'compatible_vehicles'}), compatible_vehicles=vehicles_str)
+        db.add(db_part)
+        db.commit()
+        db.refresh(db_part)
+        db_part.compatible_vehicles = db_part.compatible_vehicles.split(",") if db_part.compatible_vehicles else []
+        return db_part
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/spare_parts/{part_id}", response_model=SparePartResponse)
+@app.put("/parts/{part_id}", response_model=SparePartResponse)
+def update_spare_part(part_id: int, updated: SparePartCreate, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    db_part = db.query(models.SparePart).filter(models.SparePart.id == part_id).first()
+    if not db_part: raise HTTPException(status_code=404, detail="Güncellenecek parça bulunamadı")
+
+    vehicles_str = ",".join(updated.compatible_vehicles) if updated.compatible_vehicles else ""
+    for key, value in updated.model_dump(exclude={'compatible_vehicles'}).items():
+        setattr(db_part, key, value)
+    db_part.compatible_vehicles = vehicles_str
+
+    db.commit()
+    db.refresh(db_part)
+    db_part.compatible_vehicles = db_part.compatible_vehicles.split(",") if db_part.compatible_vehicles else []
+    return db_part
+
+@app.delete("/spare_parts/{part_id}")
+@app.delete("/parts/{part_id}")
+def delete_spare_part(part_id: int, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    db_part = db.query(models.SparePart).filter(models.SparePart.id == part_id).first()
+    if not db_part: raise HTTPException(status_code=404, detail="Silinecek parça bulunamadı")
+    db.delete(db_part)
+    db.commit()
+    return {"message": "Parça başarıyla silindi"}
+
+@app.get("/spare_parts/critical", response_model=List[SparePartResponse])
+def get_critical_parts(db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    parts = db.query(models.SparePart).filter(models.SparePart.stock_quantity <= models.SparePart.critical_stock_level).all()
+    for p in parts:
+        if isinstance(p.compatible_vehicles, str):
+            p.compatible_vehicles = p.compatible_vehicles.split(",") if p.compatible_vehicles else []
+    return parts
+
+class BrandUpdateRequest(BaseModel):
+    old_brand: str
+    new_brand: str
+
+@app.put("/spare_parts/brand")
+def update_brand_name(payload: BrandUpdateRequest, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    db.query(models.SparePart).filter(models.SparePart.brand == payload.old_brand).update({models.SparePart.brand: payload.new_brand})
+    db.commit()
+    return {"message": "Marka adı güncellendi"}
+
+@app.delete("/spare_parts/brand/{brand_name}")
+def delete_brand(brand_name: str, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    db.query(models.SparePart).filter(models.SparePart.brand == brand_name).delete()
+    db.commit()
+    return {"message": "Marka ve parçaları silindi"}
+
+# SATIŞ İŞLEMLERİ
+@app.post("/sales", response_model=SaleRecordResponse, status_code=201)
+def record_sale(sale: SaleRecordBase, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    if sale.client_transaction_id:
+        existing = db.query(models.SaleRecord).filter(models.SaleRecord.client_transaction_id == sale.client_transaction_id).first()
+        if existing: return existing
+
+    rows = db.query(models.SparePart).filter(models.SparePart.id == int(sale.part_id), models.SparePart.stock_quantity >= sale.quantity)\
+             .update({models.SparePart.stock_quantity: models.SparePart.stock_quantity - sale.quantity})
+    
+    if rows == 0: raise HTTPException(status_code=409, detail="Yetersiz stok veya ürün az önce satıldı!")
+
+    db_sale = models.SaleRecord(**sale.model_dump())
+    db.add(db_sale)
+    db.commit()
+    db.refresh(db_sale)
+    return db_sale
+
+@app.post("/sales/bulk", status_code=201)
+def record_bulk_sale(sales: List[SaleRecordBase], db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    try:
+        for sale in sales:
+            if sale.client_transaction_id and db.query(models.SaleRecord).filter(models.SaleRecord.client_transaction_id == sale.client_transaction_id).first():
+                continue
+            rows = db.query(models.SparePart).filter(models.SparePart.id == int(sale.part_id), models.SparePart.stock_quantity >= sale.quantity)\
+                     .update({models.SparePart.stock_quantity: models.SparePart.stock_quantity - sale.quantity})
+            if rows == 0: raise HTTPException(status_code=409, detail=f"{sale.part_name} için yetersiz stok!")
+            db.add(models.SaleRecord(**sale.model_dump()))
+        db.commit()
+        return {"message": "Toplu satış başarılı"}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/sales/history", response_model=List[SaleRecordResponse])
+def get_sales_history(db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    return db.query(models.SaleRecord).order_by(models.SaleRecord.created_at.desc()).limit(100).all()
+
+@app.delete("/sales/{sale_id}")
+def delete_sale(sale_id: int, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    if current_user.role != "admin": raise HTTPException(status_code=403, detail="Sadece Patron iptal edebilir!")
+    db_sale = db.query(models.SaleRecord).filter(models.SaleRecord.id == sale_id).first()
+    if not db_sale: raise HTTPException(status_code=404, detail="Kayıt bulunamadı")
+    db_part = db.query(models.SparePart).filter(models.SparePart.id == int(db_sale.part_id)).first()
+    if db_part: db_part.stock_quantity += db_sale.quantity
+    db.delete(db_sale)
+    db.commit()
+    return {"message": "İptal edildi, stok iade edildi"}
+
+@app.put("/sales/{sale_id}", response_model=SaleRecordResponse)
+def update_sale(sale_id: int, updated_sale: SaleRecordBase, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    db_sale = db.query(models.SaleRecord).filter(models.SaleRecord.id == sale_id).first()
+    if not db_sale: raise HTTPException(status_code=404, detail="Kayıt bulunamadı")
+    
+    old_part = db.query(models.SparePart).filter(models.SparePart.id == int(db_sale.part_id)).first()
+    if old_part: old_part.stock_quantity += db_sale.quantity
+        
+    new_part = db.query(models.SparePart).filter(models.SparePart.id == int(updated_sale.part_id)).first()
+    if not new_part or new_part.stock_quantity < updated_sale.quantity:
+        if old_part: old_part.stock_quantity -= db_sale.quantity
+        raise HTTPException(status_code=400, detail="Yeterli stok yok!")
+        
+    new_part.stock_quantity -= updated_sale.quantity
+    
+    for key, value in updated_sale.model_dump().items():
+        setattr(db_sale, key, value)
+    
+    db.commit()
+    db.refresh(db_sale)
+    return db_sale
+
+# TEDARİKÇİ ROTALARI
+@app.get("/suppliers", response_model=List[SupplierResponse])
+def get_suppliers(db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    return db.query(models.Supplier).all()
+
+@app.post("/suppliers", status_code=201)
+def create_supplier(supplier: SupplierBase, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    db.add(models.Supplier(**supplier.model_dump()))
+    db.commit()
+    return {"message": "Tedarikçi eklendi"}
+
+@app.put("/suppliers/{supplier_id}")
+def update_supplier(supplier_id: int, supplier: SupplierBase, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    db_sup = db.query(models.Supplier).filter(models.Supplier.id == supplier_id).first()
+    if not db_sup: raise HTTPException(status_code=404, detail="Bulunamadı")
+    for k, v in supplier.model_dump().items(): setattr(db_sup, k, v)
+    db.commit()
+    return {"message": "Güncellendi"}
+
+@app.delete("/suppliers/{supplier_id}")
+def delete_supplier(supplier_id: int, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    db_sup = db.query(models.Supplier).filter(models.Supplier.id == supplier_id).first()
+    if not db_sup: raise HTTPException(status_code=404, detail="Bulunamadı")
+    db.delete(db_sup)
+    db.commit()
+    return {"message": "Silindi"}
+
+# YAPAY ZEKA RAPORLAMA ROTASI (Geri getirildi!)
+@app.post("/generate_report")
+def generate_report(req: PromptRequest, current_user: models.User = Depends(get_current_user)):
+    try:
+        if not GEMINI_API_KEY:
+            raise HTTPException(status_code=500, detail="Gemini API Anahtarı sunucuda bulunamadı!")
+        genai.configure(api_key=GEMINI_API_KEY)
+        model = genai.GenerativeModel('gemini-2.5-flash')
+        response = model.generate_content(req.prompt)
+        return {"report": response.text}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Yapay Zeka Hatası: {str(e)}")
