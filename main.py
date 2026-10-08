@@ -500,7 +500,7 @@ def delete_spare_part(
 
 # PROFESYONEL DOKUNUŞ: Silinen parçanın barkodunu boşa çıkar ki ileride aynı barkod tekrar kullanılabilsin.
     if db_part.barcode:
-    db_part.barcode = f"DEL_{int(time.time())}_{db_part.barcode}"
+        db_part.barcode = f"DEL_{int(time.time())}_{db_part.barcode}"
 
     db_part.is_deleted = True
     db_part.deleted_at = datetime.now(timezone.utc)
