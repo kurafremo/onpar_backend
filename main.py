@@ -498,6 +498,10 @@ def delete_spare_part(
     if not db_part:
         raise HTTPException(status_code=404, detail="Silinecek parca bulunamadi.")
 
+# PROFESYONEL DOKUNUŞ: Silinen parçanın barkodunu boşa çıkar ki ileride aynı barkod tekrar kullanılabilsin.
+    if db_part.barcode:
+    db_part.barcode = f"DEL_{int(time.time())}_{db_part.barcode}"
+
     db_part.is_deleted = True
     db_part.deleted_at = datetime.now(timezone.utc)
     db.commit()
@@ -988,7 +992,7 @@ def ai_smart_barcode(
     JSON dışında hiçbir açıklama veya markdown backtick (```json) ekleme.
     """
 
-    model_candidates = ["gemini-3.6-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+    model_candidates = ["gemini-3.5-flash-lite"]
     last_error = None
 
     for model_name in model_candidates:
@@ -1029,7 +1033,7 @@ def generate_ai_report(
     if not GEMINI_API_KEY:
         raise HTTPException(status_code=503, detail="Gemini AI API Key tanimli degil.")
     
-    model_candidates = ["gemini-3.6-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+    model_candidates = ["gemini-3.8-flash"]
     last_error = None
 
     for model_name in model_candidates:
